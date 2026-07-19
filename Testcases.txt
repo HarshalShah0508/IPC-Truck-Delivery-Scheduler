@@ -1,0 +1,1397 @@
+Testcase 1                                                                      
+--- Reading values from input.txt ---                                           
+                                                                                
+N (Grid Size):      5                                                           
+D (Trucks):         3                                                           
+S (Solvers):        2                                                           
+T (Max Arrival):    5                                                           
+B (Booths):         3                                                           
+Shared Memory Key:  96396631                                                    
+Main MQ Key:        28620002                                                    
+                                                                                
+Solver Message Queue Keys:                                                      
+  Solver 0 Key: 49150341                                                        
+  Solver 1 Key: 29595608                                                        
+                                                                                
+--- End of input file --- 
+
+
+Testcase 2                                                                      
+--- Reading values from input.txt ---                                           
+                                                                                
+N (Grid Size):      10                                                          
+D (Trucks):         5                                                           
+S (Solvers):        3                                                           
+T (Max Arrival):    20                                                          
+B (Booths):         10                                                          
+Shared Memory Key:  33190817                                                    
+Main MQ Key:        36662795                                                    
+                                                                                
+Solver Message Queue Keys:                                                      
+  Solver 0 Key: 91584515                                                        
+  Solver 1 Key: 42271654                                                        
+  Solver 2 Key: 39297806                                                        
+                                                                                
+--- End of input file --- 
+
+
+Testcase 3                                                                      
+--- Reading values from input.txt ---                                           
+                                                                                
+N (Grid Size):      30                                                          
+D (Trucks):         4                                                           
+S (Solvers):        3                                                           
+T (Max Arrival):    50                                                          
+B (Booths):         30                                                          
+Shared Memory Key:  31087198                                                    
+Main MQ Key:        41737230                                                    
+                                                                                
+Solver Message Queue Keys:                                                      
+  Solver 0 Key: 33291197                                                        
+  Solver 1 Key: 11890498                                                        
+  Solver 2 Key: 32361643                                                        
+                                                                                
+--- End of input file ---   
+
+Testcase 4
+--- Reading values from input.txt ---                                           
+                                                                                
+N (Grid Size):      100                                                         
+D (Trucks):         15                                                          
+S (Solvers):        10                                                          
+T (Max Arrival):    300                                                         
+B (Booths):         75                                                          
+Shared Memory Key:  93610881                                                    
+Main MQ Key:        3153399                                                     
+                                                                                
+Solver Message Queue Keys:                                                      
+  Solver 0 Key: 38005768                                                        
+  Solver 1 Key: 16759948                                                        
+  Solver 2 Key: 65201908                                                        
+  Solver 3 Key: 2341788                                                         
+  Solver 4 Key: 53527456                                                        
+  Solver 5 Key: 73359573                                                        
+  Solver 6 Key: 66027070                                                        
+  Solver 7 Key: 25450616                                                        
+  Solver 8 Key: 52928990                                                        
+  Solver 9 Key: 86535142                                                        
+                                                                                
+--- End of input file --- 
+
+
+
+Code 1: 4th test case 5k and 500
+
+#include "helper.h"
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/shm.h>
+
+int N, D, S, T, B;
+key_t shmKey;
+key_t mainMqKey;
+key_t solverMqKeys[MAX_SOLVERS];
+
+MainSharedMemory *mainShmPtr;
+int mainMqId;
+int solverMqIds[MAX_SOLVERS];
+int g_current_turn = 0;
+
+typedef enum {
+    PKG_NONE,
+    PKG_WAITING,
+    PKG_ASSIGNED,
+    PKG_ON_TRUCK,
+    PKG_DELIVERED
+} PkgStatus;
+
+typedef enum {
+    TRUCK_IDLE,
+    TRUCK_TO_PICKUP,
+    TRUCK_TO_DROPOFF
+} TruckStatus;
+
+typedef struct {
+    PackageRequest request;
+    PkgStatus status;
+} PackageTracker;
+
+typedef struct {
+    TruckStatus status;
+    int pkg_id;
+} TruckTracker;
+
+PackageTracker g_package_db[MAX_TOTAL_PACKAGES];
+TruckTracker g_truck_db[MAX_TRUCKS];
+
+typedef struct {
+    int truck_idx;
+    int auth_len;
+} SolverJob;
+
+int g_solver_pool[MAX_SOLVERS];
+int g_solver_count;
+pthread_mutex_t g_pool_lock;
+pthread_cond_t g_pool_cv;
+
+bool guess_auth_recursive(int truck_idx, int solver_q_id, char* guess_buf, int auth_len, int k) {
+    if (k == auth_len) {
+        guess_buf[auth_len] = '\0';
+        
+        SolverRequest req;
+        req.mtype = 3;
+        req.truckNumber = truck_idx;
+        strcpy(req.authStringGuess, guess_buf);
+        if (msgsnd(solver_q_id, &req, sizeof(SolverRequest) - sizeof(long), 0) == -1) {
+            perror("[Solution] msgsnd to solver failed");
+            return false;
+        }
+
+        SolverResponse res;
+        if (msgrcv(solver_q_id, &res, sizeof(SolverResponse) - sizeof(long), 4, 0) == -1) {
+            perror("[Solution] msgrcv from solver failed");
+            return false;
+        }
+        return res.guessIsCorrect == 1;
+    }
+
+    char moves[] = {'u', 'd', 'l', 'r'};
+    for (int i = 0; i < 4; i++) {
+        guess_buf[k] = moves[i];
+        if (guess_auth_recursive(truck_idx, solver_q_id, guess_buf, auth_len, k + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void* solver_thread_main(void* arg) {
+    SolverJob* job = (SolverJob*)arg;
+    int truck_idx = job->truck_idx;
+    int auth_len = job->auth_len;
+    
+    pthread_mutex_lock(&g_pool_lock);
+    while (g_solver_count == 0) {
+        pthread_cond_wait(&g_pool_cv, &g_pool_lock);
+    }
+    int solver_id = g_solver_pool[--g_solver_count];
+    pthread_mutex_unlock(&g_pool_lock);
+    
+    int solver_q_id = solverMqIds[solver_id];
+    
+    SolverRequest req;
+    req.mtype = 2;
+    req.truckNumber = truck_idx;
+    strcpy(req.authStringGuess, "");
+    msgsnd(solver_q_id, &req, sizeof(SolverRequest) - sizeof(long), 0);
+    
+    char guess_buf[TRUCK_MAX_CAP + 1];
+    if (guess_auth_recursive(truck_idx, solver_q_id, guess_buf, auth_len, 0)) {
+        strcpy(mainShmPtr->authStrings[truck_idx], guess_buf);
+    } else {
+    }
+
+    pthread_mutex_lock(&g_pool_lock);
+    g_solver_pool[g_solver_count++] = solver_id;
+    pthread_cond_signal(&g_pool_cv);
+    pthread_mutex_unlock(&g_pool_lock);
+    
+    return NULL;
+}
+
+typedef struct {
+    int truck_id;
+    int package_id;
+    int score;
+} Assignment;
+
+int compare_score(const void* a, const void* b) {
+    return ((Assignment*)a)->score - ((Assignment*)b)->score;
+}
+
+void run_turn_logic(int turn_num, int new_pkg_count) {
+    g_current_turn = turn_num;
+    
+    for (int i = 0; i < new_pkg_count; i++) {
+        PackageRequest req = mainShmPtr->newPackageRequests[i];
+        g_package_db[req.packageId].request = req;
+        g_package_db[req.packageId].status = PKG_WAITING;
+    }
+
+    {
+        Assignment all_jobs[D * MAX_TOTAL_PACKAGES];
+        int job_count = 0;
+        
+        bool is_truck_busy[D];
+        bool is_pkg_assigned[MAX_TOTAL_PACKAGES];
+        memset(is_truck_busy, 0, sizeof(is_truck_busy));
+        memset(is_pkg_assigned, 0, sizeof(is_pkg_assigned));
+
+        for (int i = 0; i < D; i++) {
+            if (g_truck_db[i].status == TRUCK_IDLE) {
+                for (int j = 0; j < MAX_TOTAL_PACKAGES; j++) {
+                    if (g_package_db[j].status == PKG_WAITING) {
+                        PackageRequest* pkg = &g_package_db[j].request;
+                        int* pos = mainShmPtr->truckPositions[i];
+                        
+                        int t_pickup = abs(pos[0] - pkg->pickup_x) + abs(pos[1] - pkg->pickup_y);
+                        int t_deliver = abs(pkg->pickup_x - pkg->dropoff_x) + abs(pkg->pickup_y - pkg->dropoff_y);
+                        int t_total = t_pickup + t_deliver;
+                        
+                        int time_buffer = pkg->expiry_turn - (g_current_turn + t_total);
+                        
+                        int urgency_cost = (time_buffer < 0) ? 100000 : 0;
+                        urgency_cost += (time_buffer < 20) ? (20 - time_buffer) * 50 : 0;
+                        
+                        int total_score = t_pickup + urgency_cost;
+
+                        all_jobs[job_count].truck_id = i;
+                        all_jobs[job_count].package_id = j;
+                        all_jobs[job_count].score = total_score;
+                        job_count++;
+                    }
+                }
+            }
+        }
+
+        qsort(all_jobs, job_count, sizeof(Assignment), compare_score);
+        
+        for (int i = 0; i < job_count; i++) {
+            int truck_id = all_jobs[i].truck_id;
+            int pkg_id = all_jobs[i].package_id;
+            
+            if (g_truck_db[truck_id].status == TRUCK_IDLE && g_package_db[pkg_id].status == PKG_WAITING) {
+                g_truck_db[truck_id].status = TRUCK_TO_PICKUP;
+                g_truck_db[truck_id].pkg_id = pkg_id;
+                g_package_db[pkg_id].status = PKG_ASSIGNED;
+            }
+        }
+    }
+
+
+    pthread_t threads[D];
+    SolverJob args[D];
+    bool has_thread[D];
+    char move_cmds[D];
+    memset(has_thread, 0, sizeof(has_thread));
+
+    for (int i = 0; i < D; i++) {
+        mainShmPtr->pickUpCommands[i] = -1;
+        mainShmPtr->dropOffCommands[i] = -1;
+        strcpy(mainShmPtr->authStrings[i], "");
+
+        if (mainShmPtr->truckTurnsInToll[i] > 0) {
+            move_cmds[i] = 's';
+            continue;
+        }
+
+        int* pos = mainShmPtr->truckPositions[i];
+        
+        switch(g_truck_db[i].status) {
+            case TRUCK_IDLE:
+                move_cmds[i] = 's';
+                break;
+            
+            case TRUCK_TO_PICKUP: {
+                int target_pkg = g_truck_db[i].pkg_id;
+                PackageRequest* pkg = &g_package_db[target_pkg].request;
+                
+                if (pos[0] < pkg->pickup_x) move_cmds[i] = 'r';
+                else if (pos[0] > pkg->pickup_x) move_cmds[i] = 'l';
+                else if (pos[1] < pkg->pickup_y) move_cmds[i] = 'd';
+                else if (pos[1] > pkg->pickup_y) move_cmds[i] = 'u';
+                else move_cmds[i] = 's';
+
+                if (move_cmds[i] == 's') {
+                    mainShmPtr->pickUpCommands[i] = target_pkg;
+                    g_truck_db[i].status = TRUCK_TO_DROPOFF;
+                    g_package_db[target_pkg].status = PKG_ON_TRUCK;
+                }
+                break;
+            }
+
+            case TRUCK_TO_DROPOFF: {
+                int target_pkg = g_truck_db[i].pkg_id;
+                PackageRequest* pkg = &g_package_db[target_pkg].request;
+
+                if (pos[0] < pkg->dropoff_x) move_cmds[i] = 'r';
+                else if (pos[0] > pkg->dropoff_x) move_cmds[i] = 'l';
+                else if (pos[1] < pkg->dropoff_y) move_cmds[i] = 'd';
+                else if (pos[1] > pkg->dropoff_y) move_cmds[i] = 'u';
+                else move_cmds[i] = 's';
+
+                if (move_cmds[i] == 's') {
+                    mainShmPtr->dropOffCommands[i] = target_pkg;
+                    g_truck_db[i].status = TRUCK_IDLE;
+                    g_package_db[target_pkg].status = PKG_DELIVERED;
+                }
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < D; i++) {
+        int pkg_count = mainShmPtr->truckPackageCount[i];
+        
+        if (mainShmPtr->truckTurnsInToll[i] == 0 && move_cmds[i] != 's' && pkg_count > 0) {
+            
+            args[i].truck_idx = i;
+            args[i].auth_len = pkg_count;
+            
+            if (pthread_create(&threads[i], NULL, solver_thread_main, &args[i]) != 0) {
+                perror("[Solution] pthread_create failed");
+            }
+            has_thread[i] = true;
+        } else {
+            mainShmPtr->truckMovementInstructions[i] = move_cmds[i];
+        }
+    }
+
+    for (int i = 0; i < D; i++) {
+        if (has_thread[i]) {
+            pthread_join(threads[i], NULL);
+            mainShmPtr->truckMovementInstructions[i] = move_cmds[i];
+        }
+    }
+}
+
+int main() {
+    FILE *f = fopen("input.txt", "r");
+    if (f == NULL) {
+        perror("[Solution] Error opening input.txt");
+        exit(1);
+    }
+    fscanf(f, "%d %d %d %d %d %d %d", &N, &D, &S, &T, &B, &shmKey, &mainMqKey);
+    for (int i = 0; i < S; i++) {
+        fscanf(f, "%d", &solverMqKeys[i]);
+    }
+    fclose(f);
+
+    int shm_id = shmget(shmKey, sizeof(MainSharedMemory), PERMS);
+    if (shm_id == -1) {
+        perror("[Solution] shmget failed");
+        exit(1);
+    }
+    mainShmPtr = (MainSharedMemory *)shmat(shm_id, NULL, 0);
+    if (mainShmPtr == (void *)-1) {
+        perror("[Solution] shmat failed");
+        exit(1);
+    }
+
+    mainMqId = msgget(mainMqKey, PERMS);
+    if (mainMqId == -1) {
+        perror("[Solution] msgget (main) failed");
+        exit(1);
+    }
+
+    for (int i = 0; i < S; i++) {
+        solverMqIds[i] = msgget(solverMqKeys[i], PERMS);
+        if (solverMqIds[i] == -1) {
+            perror("[Solution] msgget (solver) failed");
+            exit(1);
+        }
+    }
+
+    pthread_mutex_init(&g_pool_lock, NULL);
+    pthread_cond_init(&g_pool_cv, NULL);
+    g_solver_count = S;
+    for(int i = 0; i < S; i++) {
+        g_solver_pool[i] = i;
+    }
+
+    memset(g_package_db, 0, sizeof(g_package_db));
+    memset(g_truck_db, 0, sizeof(g_truck_db));
+
+    TurnChangeResponse turn_msg;
+    TurnReadyRequest ready_msg;
+    ready_msg.mtype = 1;
+
+    while (1) {
+        if (msgrcv(mainMqId, &turn_msg, sizeof(TurnChangeResponse) - sizeof(long), 2, 0) == -1) {
+            perror("[Solution] msgrcv (main) failed");
+            break;
+        }
+
+        if (turn_msg.errorOccured) break;
+        if (turn_msg.finished) {
+            break;
+        }
+
+        run_turn_logic(turn_msg.turnNumber, turn_msg.newPackageRequestCount);
+
+        if (msgsnd(mainMqId, &ready_msg, sizeof(TurnReadyRequest) - sizeof(long), 0) == -1) {
+            perror("[Solution] msgsnd (main) failed");
+            break;
+        }
+    }
+
+    if (shmdt(mainShmPtr) == -1) {
+        perror("[Solution] shmdt failed");
+    }
+
+    pthread_mutex_destroy(&g_pool_lock);
+    pthread_cond_destroy(&g_pool_cv);
+    
+    return 0;
+} 
+
+
+Code 2: CPU Scheduling algorithm used
+
+#include "helper.h"
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/shm.h>
+
+int N, D, S, T, B;
+key_t shmKey;
+key_t mainMqKey;
+key_t solverMqKeys[MAX_SOLVERS];
+
+MainSharedMemory *mainShmPtr;
+int mainMqId;
+int solverMqIds[MAX_SOLVERS];
+int g_current_turn = 0;
+
+typedef enum {
+    PKG_NONE,
+    PKG_WAITING,
+    PKG_ASSIGNED,
+    PKG_ON_TRUCK,
+    PKG_DELIVERED
+} PkgStatus;
+
+typedef enum {
+    TRUCK_IDLE,
+    TRUCK_TO_PICKUP,
+    TRUCK_TO_DROPOFF
+} TruckStatus;
+
+typedef struct {
+    PackageRequest request;
+    PkgStatus status;
+} PackageTracker;
+
+typedef struct {
+    TruckStatus status;
+    int pkg_id;
+} TruckTracker;
+
+PackageTracker g_package_db[MAX_TOTAL_PACKAGES];
+TruckTracker g_truck_db[MAX_TRUCKS];
+
+typedef struct {
+    int truck_idx;
+    int auth_len;
+} SolverJob;
+
+int g_solver_pool[MAX_SOLVERS];
+int g_solver_count;
+pthread_mutex_t g_pool_lock;
+pthread_cond_t g_pool_cv;
+
+bool guess_auth_recursive(int truck_idx, int solver_q_id, char* guess_buf, int auth_len, int k) {
+    if (k == auth_len) {
+        guess_buf[auth_len] = '\0';
+        
+        SolverRequest req;
+        req.mtype = 3;
+        req.truckNumber = truck_idx;
+        strcpy(req.authStringGuess, guess_buf);
+        if (msgsnd(solver_q_id, &req, sizeof(SolverRequest) - sizeof(long), 0) == -1) {
+            perror("[Solution] msgsnd to solver failed");
+            return false;
+        }
+
+        SolverResponse res;
+        if (msgrcv(solver_q_id, &res, sizeof(SolverResponse) - sizeof(long), 4, 0) == -1) {
+            perror("[Solution] msgrcv from solver failed");
+            return false;
+        }
+        return res.guessIsCorrect == 1;
+    }
+
+    char moves[] = {'u', 'd', 'l', 'r'};
+    for (int i = 0; i < 4; i++) {
+        guess_buf[k] = moves[i];
+        if (guess_auth_recursive(truck_idx, solver_q_id, guess_buf, auth_len, k + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void* solver_thread_main(void* arg) {
+    SolverJob* job = (SolverJob*)arg;
+    int truck_idx = job->truck_idx;
+    int auth_len = job->auth_len;
+    
+    pthread_mutex_lock(&g_pool_lock);
+    while (g_solver_count == 0) {
+        pthread_cond_wait(&g_pool_cv, &g_pool_lock);
+    }
+    int solver_id = g_solver_pool[--g_solver_count];
+    pthread_mutex_unlock(&g_pool_lock);
+    
+    int solver_q_id = solverMqIds[solver_id];
+    
+    SolverRequest req;
+    req.mtype = 2;
+    req.truckNumber = truck_idx;
+    strcpy(req.authStringGuess, "");
+    msgsnd(solver_q_id, &req, sizeof(SolverRequest) - sizeof(long), 0);
+    
+    char guess_buf[TRUCK_MAX_CAP + 1];
+    if (guess_auth_recursive(truck_idx, solver_q_id, guess_buf, auth_len, 0)) {
+        strcpy(mainShmPtr->authStrings[truck_idx], guess_buf);
+    } else {
+    }
+
+    pthread_mutex_lock(&g_pool_lock);
+    g_solver_pool[g_solver_count++] = solver_id;
+    pthread_cond_signal(&g_pool_cv);
+    pthread_mutex_unlock(&g_pool_lock);
+    
+    return NULL;
+}
+
+typedef struct {
+    int truck_id;
+    int package_id;
+    int score;
+} Assignment;
+
+int compare_score(const void* a, const void* b) {
+    return ((Assignment*)a)->score - ((Assignment*)b)->score;
+}
+
+void run_turn_logic(int turn_num, int new_pkg_count) {
+    g_current_turn = turn_num;
+    
+    for (int i = 0; i < new_pkg_count; i++) {
+        PackageRequest req = mainShmPtr->newPackageRequests[i];
+        g_package_db[req.packageId].request = req;
+        g_package_db[req.packageId].status = PKG_WAITING;
+    }
+
+    {
+        Assignment all_jobs[D * MAX_TOTAL_PACKAGES];
+        int job_count = 0;
+        
+        bool is_truck_busy[D];
+        bool is_pkg_assigned[MAX_TOTAL_PACKAGES];
+        memset(is_truck_busy, 0, sizeof(is_truck_busy));
+        memset(is_pkg_assigned, 0, sizeof(is_pkg_assigned));
+
+        for (int i = 0; i < D; i++) {
+            if (g_truck_db[i].status == TRUCK_IDLE) {
+                for (int j = 0; j < MAX_TOTAL_PACKAGES; j++) {
+                    if (g_package_db[j].status == PKG_WAITING) {
+                        PackageRequest* pkg = &g_package_db[j].request;
+                        int* pos = mainShmPtr->truckPositions[i];
+                        
+                        int t_pickup = abs(pos[0] - pkg->pickup_x) + abs(pos[1] - pkg->pickup_y);
+                        int t_deliver = abs(pkg->pickup_x - pkg->dropoff_x) + abs(pkg->pickup_y - pkg->dropoff_y);
+                        int t_total = t_pickup + t_deliver;
+                        
+                        int slack_time = (pkg->expiry_turn - g_current_turn) - t_total;
+
+                        all_jobs[job_count].truck_id = i;
+                        all_jobs[job_count].package_id = j;
+                        all_jobs[job_count].score = slack_time;
+                        job_count++;
+                    }
+                }
+            }
+        }
+
+        qsort(all_jobs, job_count, sizeof(Assignment), compare_score);
+        
+        for (int i = 0; i < job_count; i++) {
+            int truck_id = all_jobs[i].truck_id;
+            int pkg_id = all_jobs[i].package_id;
+            
+            if (g_truck_db[truck_id].status == TRUCK_IDLE && g_package_db[pkg_id].status == PKG_WAITING) {
+                g_truck_db[truck_id].status = TRUCK_TO_PICKUP;
+                g_truck_db[truck_id].pkg_id = pkg_id;
+                g_package_db[pkg_id].status = PKG_ASSIGNED;
+            }
+        }
+    }
+
+
+    pthread_t threads[D];
+    SolverJob args[D];
+    bool has_thread[D];
+    char move_cmds[D];
+    memset(has_thread, 0, sizeof(has_thread));
+
+    for (int i = 0; i < D; i++) {
+        mainShmPtr->pickUpCommands[i] = -1;
+        mainShmPtr->dropOffCommands[i] = -1;
+        strcpy(mainShmPtr->authStrings[i], "");
+
+        if (mainShmPtr->truckTurnsInToll[i] > 0) {
+            move_cmds[i] = 's';
+            continue;
+        }
+
+        int* pos = mainShmPtr->truckPositions[i];
+        
+        switch(g_truck_db[i].status) {
+            case TRUCK_IDLE:
+                move_cmds[i] = 's';
+                break;
+            
+            case TRUCK_TO_PICKUP: {
+                int target_pkg = g_truck_db[i].pkg_id;
+                PackageRequest* pkg = &g_package_db[target_pkg].request;
+                
+                if (pos[0] < pkg->pickup_x) move_cmds[i] = 'r';
+                else if (pos[0] > pkg->pickup_x) move_cmds[i] = 'l';
+                else if (pos[1] < pkg->pickup_y) move_cmds[i] = 'd';
+                else if (pos[1] > pkg->pickup_y) move_cmds[i] = 'u';
+                else move_cmds[i] = 's';
+
+                if (move_cmds[i] == 's') {
+                    mainShmPtr->pickUpCommands[i] = target_pkg;
+                    g_truck_db[i].status = TRUCK_TO_DROPOFF;
+                    g_package_db[target_pkg].status = PKG_ON_TRUCK;
+                }
+                break;
+            }
+
+            case TRUCK_TO_DROPOFF: {
+                int target_pkg = g_truck_db[i].pkg_id;
+                PackageRequest* pkg = &g_package_db[target_pkg].request;
+
+                if (pos[0] < pkg->dropoff_x) move_cmds[i] = 'r';
+                else if (pos[0] > pkg->dropoff_x) move_cmds[i] = 'l';
+                else if (pos[1] < pkg->dropoff_y) move_cmds[i] = 'd';
+                else if (pos[1] > pkg->dropoff_y) move_cmds[i] = 'u';
+                else move_cmds[i] = 's';
+
+                if (move_cmds[i] == 's') {
+                    mainShmPtr->dropOffCommands[i] = target_pkg;
+                    g_truck_db[i].status = TRUCK_IDLE;
+                    g_package_db[target_pkg].status = PKG_DELIVERED;
+                }
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < D; i++) {
+        int pkg_count = mainShmPtr->truckPackageCount[i];
+        
+        if (mainShmPtr->truckTurnsInToll[i] == 0 && move_cmds[i] != 's' && pkg_count > 0) {
+            
+            args[i].truck_idx = i;
+            args[i].auth_len = pkg_count;
+            
+            if (pthread_create(&threads[i], NULL, solver_thread_main, &args[i]) != 0) {
+                perror("[Solution] pthread_create failed");
+            }
+            has_thread[i] = true;
+        } else {
+            mainShmPtr->truckMovementInstructions[i] = move_cmds[i];
+        }
+    }
+
+    for (int i = 0; i < D; i++) {
+        if (has_thread[i]) {
+            pthread_join(threads[i], NULL);
+            mainShmPtr->truckMovementInstructions[i] = move_cmds[i];
+        }
+    }
+}
+
+int main() {
+    FILE *f = fopen("input.txt", "r");
+    if (f == NULL) {
+        perror("[Solution] Error opening input.txt");
+        exit(1);
+    }
+    fscanf(f, "%d %d %d %d %d %d %d", &N, &D, &S, &T, &B, &shmKey, &mainMqKey);
+    for (int i = 0; i < S; i++) {
+        fscanf(f, "%d", &solverMqKeys[i]);
+    }
+    fclose(f);
+
+    int shm_id = shmget(shmKey, sizeof(MainSharedMemory), PERMS);
+    if (shm_id == -1) {
+        perror("[Solution] shmget failed");
+        exit(1);
+    }
+    mainShmPtr = (MainSharedMemory *)shmat(shm_id, NULL, 0);
+    if (mainShmPtr == (void *)-1) {
+        perror("[Solution] shmat failed");
+        exit(1);
+    }
+
+    mainMqId = msgget(mainMqKey, PERMS);
+    if (mainMqId == -1) {
+        perror("[Solution] msgget (main) failed");
+        exit(1);
+    }
+
+    for (int i = 0; i < S; i++) {
+        solverMqIds[i] = msgget(solverMqKeys[i], PERMS);
+        if (solverMqIds[i] == -1) {
+            perror("[Solution] msgget (solver) failed");
+            exit(1);
+        }
+    }
+
+    pthread_mutex_init(&g_pool_lock, NULL);
+    pthread_cond_init(&g_pool_cv, NULL);
+    g_solver_count = S;
+    for(int i = 0; i < S; i++) {
+        g_solver_pool[i] = i;
+    }
+
+    memset(g_package_db, 0, sizeof(g_package_db));
+    memset(g_truck_db, 0, sizeof(g_truck_db));
+
+    TurnChangeResponse turn_msg;
+    TurnReadyRequest ready_msg;
+    ready_msg.mtype = 1;
+
+    while (1) {
+        if (msgrcv(mainMqId, &turn_msg, sizeof(TurnChangeResponse) - sizeof(long), 2, 0) == -1) {
+            perror("[Solution] msgrcv (main) failed");
+            break;
+        }
+
+        if (turn_msg.errorOccured) {
+            break;
+        }
+        if (turn_msg.finished) {
+            break;
+        }
+
+        run_turn_logic(turn_msg.turnNumber, turn_msg.newPackageRequestCount);
+
+        if (msgsnd(mainMqId, &ready_msg, sizeof(TurnReadyRequest) - sizeof(long), 0) == -1) {
+            perror("[Solution] msgsnd (main) failed");
+            break;
+        }
+    }
+
+    if (shmdt(mainShmPtr) == -1) {
+        perror("[Solution] shmdt failed");
+    }
+
+    pthread_mutex_destroy(&g_pool_lock);
+    pthread_cond_destroy(&g_pool_cv);
+    
+    return 0;
+}
+
+Code 3: 
+#include "helper.h"
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+
+#define INF 10000000
+
+int gridDim, truckCount, solverCount, maxTurnLimit, boothCount;
+key_t memoryKey, mainQueueKey, solverQueueKeys[MAX_SOLVERS];
+MainSharedMemory *memory;
+int mainQueue, solverQueues[MAX_SOLVERS];
+int activeTurn = 0;
+
+typedef struct {
+    PackageRequest info;
+    int state;
+    int truckOwner;
+    int urgencyScore;
+} PackageData;
+
+typedef struct {
+    int currentJob;
+    int nextJob;
+    int jobList[TRUCK_MAX_CAP];
+    int jobCount;
+    int mode;
+} TruckData;
+
+PackageData allPackages[MAX_TOTAL_PACKAGES];
+TruckData allTrucks[MAX_TRUCKS];
+int availableSolvers[MAX_SOLVERS];
+int solverPoolSize;
+pthread_mutex_t solverMutex;
+pthread_cond_t solverCondition;
+
+typedef struct {
+    int truckIndex;
+    int stringLength;
+} AuthTask;
+
+int calculateDistance(int x1, int y1, int x2, int y2) {
+    return abs(x1 - x2) + abs(y1 - y2);
+}
+
+char computeNextDirection(int currentX, int currentY, int targetX, int targetY) {
+    if (currentX == targetX && currentY == targetY) {
+        return 's';
+    }
+    
+    if (currentX < targetX) return 'r';
+    if (currentX > targetX) return 'l';
+    if (currentY < targetY) return 'd';
+    if (currentY > targetY) return 'u';
+    
+    return 's';
+}
+
+bool recursiveAuthGuess(int truck, int solverQueue, char* buffer, int length, int position) {
+    if (position == length) {
+        buffer[length] = '\0';
+        
+        SolverRequest request;
+        request.mtype = 3;
+        request.truckNumber = truck;
+        strcpy(request.authStringGuess, buffer);
+        if (msgsnd(solverQueue, &request, sizeof(SolverRequest) - sizeof(long), 0) == -1) {
+            perror("[Solution] msgsnd to solver");
+        }
+
+        SolverResponse response;
+        if (msgrcv(solverQueue, &response, sizeof(SolverResponse) - sizeof(long), 4, 0) == -1) {
+            perror("[Solution] msgrcv from solver");
+        }
+        return response.guessIsCorrect == 1;
+    }
+
+    char directions[] = {'u', 'd', 'l', 'r'};
+    for (int i = 0; i < 4; i++) {
+        buffer[position] = directions[i];
+        if (recursiveAuthGuess(truck, solverQueue, buffer, length, position + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void* solverWorker(void* argument) {
+    AuthTask* task = (AuthTask*)argument;
+    int truck = task->truckIndex;
+    int length = task->stringLength;
+    
+    pthread_mutex_lock(&solverMutex);
+    while (solverPoolSize == 0) {
+        pthread_cond_wait(&solverCondition, &solverMutex);
+    }
+    int solver = availableSolvers[--solverPoolSize];
+    pthread_mutex_unlock(&solverMutex);
+    
+    int solverQueue = solverQueues[solver];
+    
+    SolverRequest setup;
+    setup.mtype = 2;
+    setup.truckNumber = truck;
+    strcpy(setup.authStringGuess, "");
+    if (msgsnd(solverQueue, &setup, sizeof(SolverRequest) - sizeof(long), 0) == -1) {
+         perror("[Solution] msgsnd to solver (setup)");
+    }
+    
+    char authBuffer[TRUCK_MAX_CAP + 1];
+    if (recursiveAuthGuess(truck, solverQueue, authBuffer, length, 0)) {
+        strcpy(memory->authStrings[truck], authBuffer);
+    }
+
+    pthread_mutex_lock(&solverMutex);
+    availableSolvers[solverPoolSize++] = solver;
+    pthread_cond_signal(&solverCondition);
+    pthread_mutex_unlock(&solverMutex);
+    
+    return NULL;
+}
+
+typedef struct {
+    int truck;
+    int package;
+    int priority;
+} WorkAssignment;
+
+int compareAssignments(const void* a, const void* b) {
+    return ((WorkAssignment*)a)->priority - ((WorkAssignment*)b)->priority;
+}
+
+
+int** createCostMatrix(int* idleTrucks, int idleTruckCount, int* waitingPackages, int waitingPackageCount, int* n) {
+    *n = (idleTruckCount > waitingPackageCount) ? idleTruckCount : waitingPackageCount;
+    int** costMatrix = malloc(*n * sizeof(int*));
+    if (costMatrix == NULL) {
+        perror("[Solution] costMatrix malloc failed");
+        return NULL;
+    }
+
+    for(int i = 0; i < *n; i++) {
+        costMatrix[i] = malloc(*n * sizeof(int));
+        if (costMatrix[i] == NULL) {
+            perror("[Solution] costMatrix[i] malloc failed");
+            for(int k = 0; k < i; k++) free(costMatrix[k]);
+            free(costMatrix);
+            return NULL;
+        }
+    }
+
+    for (int i = 0; i < idleTruckCount; i++) {
+        for (int j = 0; j < waitingPackageCount; j++) {
+            int t = idleTrucks[i];
+            int p = waitingPackages[j];
+
+            PackageRequest* pkg = &allPackages[p].info;
+            int* position = memory->truckPositions[t];
+            
+            int distanceToPickup = calculateDistance(position[0], position[1], pkg->pickup_x, pkg->pickup_y);
+            int distanceToDeliver = calculateDistance(pkg->pickup_x, pkg->pickup_y, pkg->dropoff_x, pkg->dropoff_y);
+            int totalTime = distanceToPickup + distanceToDeliver;
+            
+            int timeRemaining = pkg->expiry_turn - activeTurn - totalTime;
+            
+            int urgencyCost = 0;
+            if (timeRemaining < 0) {
+                urgencyCost = 1000000 + abs(timeRemaining) * 10000;
+            } else if (timeRemaining < 10) {
+                urgencyCost = (10 - timeRemaining) * 1000;
+            } else if (timeRemaining < 30) {
+                urgencyCost = (30 - timeRemaining) * 100;
+            }
+            
+            costMatrix[i][j] = distanceToPickup * 10 + urgencyCost + totalTime;
+        }
+    }
+
+    for(int i = 0; i < *n; i++) {
+        for(int j = 0; j < *n; j++) {
+            if(i >= idleTruckCount || j >= waitingPackageCount) {
+                costMatrix[i][j] = INF;
+            }
+        }
+    }
+    
+    return costMatrix;
+}
+
+void freeCostMatrix(int** matrix, int n) {
+    for(int i = 0; i < n; i++) {
+        free(matrix[i]);
+    }
+    free(matrix);
+}
+
+void hungarian_step(int* assignment, int** dist, int* u, int* v, int* p, int* way, bool* used, int n, int i) {
+    used[i] = true;
+    int j0 = 0;
+    int delta = INF;
+    int j1;
+    for (int j = 1; j <= n; j++) {
+        if (!used[j]) {
+            int cur = dist[i-1][j-1] - u[i] - v[j];
+            if (cur < p[j]) {
+                p[j] = cur;
+                way[j] = i;
+            }
+            if (p[j] < delta) {
+                delta = p[j];
+                j0 = j;
+            }
+        }
+    }
+
+    for (int j = 0; j <= n; j++) {
+        if (used[j]) {
+            u[way[j]] += delta;
+            v[j] -= delta;
+        } else {
+            p[j] -= delta;
+        }
+    }
+
+    j1 = j0;
+    while (j1 != 0) {
+        j0 = way[j1];
+        way[j1] = j0;
+        j1 = assignment[j0];
+        assignment[j0] = j0; 
+    }
+}
+
+int* solveHungarian(int** costMatrix, int n) {
+    int* u = calloc(n + 1, sizeof(int));
+    int* v = calloc(n + 1, sizeof(int));
+    int* p = calloc(n + 1, sizeof(int));
+    int* way = calloc(n + 1, sizeof(int));
+    int* assignment = calloc(n + 1, sizeof(int));
+
+    if (u == NULL || v == NULL || p == NULL || way == NULL || assignment == NULL) {
+        perror("[Solution] Initial calloc failed in solveHungarian");
+        if(u) free(u);
+        if(v) free(v);
+        if(p) free(p);
+        if(way) free(way);
+        if(assignment) free(assignment);
+        return NULL;
+    }
+
+    for (int i = 1; i <= n; i++) {
+        assignment[0] = i;
+        int j0 = 0;
+        int* minv = calloc(n + 1, sizeof(int));
+        if (minv == NULL) {
+             perror("[Solution] minv calloc failed in solveHungarian");
+             free(u); free(v); free(p); free(way); free(assignment);
+             return NULL;
+        }
+        for(int j = 1; j <= n; j++) minv[j] = INF;
+        
+        bool* used = calloc(n + 1, sizeof(bool));
+        if (used == NULL) {
+             perror("[Solution] used calloc failed in solveHungarian");
+             free(u); free(v); free(p); free(way); free(assignment); free(minv);
+             return NULL;
+        }
+        
+        do {
+            used[j0] = true;
+            int i0 = assignment[j0], delta = INF, j1;
+            for (int j = 1; j <= n; j++) {
+                if (!used[j]) {
+                    int cur = costMatrix[i0-1][j-1] - u[i0] - v[j];
+                    if (cur < minv[j]) {
+                        minv[j] = cur;
+                        way[j] = j0;
+                    }
+                    if (minv[j] < delta) {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+            }
+            for (int j = 0; j <= n; j++) {
+                if (used[j]) {
+                    u[assignment[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    minv[j] -= delta;
+                }
+            }
+            j0 = j1;
+        } while (assignment[j0] != 0);
+
+        do {
+            int j1 = way[j0];
+            assignment[j0] = assignment[j1];
+            j0 = j1;
+        } while (j0);
+
+        free(minv);
+        free(used);
+    }
+    
+    int* result = malloc(n * sizeof(int));
+    if (result == NULL) {
+        perror("[Solution] result malloc failed in solveHungarian");
+        free(u); free(v); free(p); free(way); free(assignment);
+        return NULL;
+    }
+
+    for(int i = 1; i <= n; i++) {
+        result[assignment[i]-1] = i-1;
+    }
+
+    free(u);
+    free(v);
+    free(p);
+    free(way);
+    free(assignment);
+    
+    return result;
+}
+
+void assignPackagesToTrucks(int newPackageCount) {
+    for (int i = 0; i < newPackageCount; i++) {
+        PackageRequest req = memory->newPackageRequests[i];
+        allPackages[req.packageId].info = req;
+        allPackages[req.packageId].state = 1;
+        
+        int timeToExpire = req.expiry_turn - activeTurn;
+        int routeDistance = calculateDistance(req.pickup_x, req.pickup_y, req.dropoff_x, req.dropoff_y);
+        allPackages[req.packageId].urgencyScore = timeToExpire - routeDistance;
+    }
+
+    int* idleTrucks = malloc(truckCount * sizeof(int));
+    int idleTruckCount = 0;
+    int* waitingPackages = malloc(MAX_TOTAL_PACKAGES * sizeof(int));
+    int waitingPackageCount = 0;
+    
+    if(!idleTrucks || !waitingPackages) {
+        if(idleTrucks) free(idleTrucks);
+        if(waitingPackages) free(waitingPackages);
+        perror("[Solution] Failed to allocate memory for assignment lists");
+        return;
+    }
+
+    for (int t = 0; t < truckCount; t++) {
+        if (allTrucks[t].currentJob == -1 && allTrucks[t].jobCount == 0) {
+            idleTrucks[idleTruckCount++] = t;
+        }
+    }
+    
+    for (int p = 0; p < MAX_TOTAL_PACKAGES; p++) {
+        if (allPackages[p].state == 1) {
+            waitingPackages[waitingPackageCount++] = p;
+        }
+    }
+
+    if(idleTruckCount == 0 || waitingPackageCount == 0) {
+        free(idleTrucks);
+        free(waitingPackages);
+        return;
+    }
+
+    int n;
+    int** costMatrix = createCostMatrix(idleTrucks, idleTruckCount, waitingPackages, waitingPackageCount, &n);
+    if (costMatrix == NULL) {
+        free(idleTrucks);
+        free(waitingPackages);
+        return;
+    }
+    
+    int* assignment = solveHungarian(costMatrix, n);
+    if (assignment == NULL) {
+        freeCostMatrix(costMatrix, n);
+        free(idleTrucks);
+        free(waitingPackages);
+        return;
+    }
+    
+    for (int i = 0; i < idleTruckCount; i++) {
+        int t = idleTrucks[i];
+        int p_idx = assignment[i];
+        
+        if (p_idx < waitingPackageCount) {
+            int p = waitingPackages[p_idx];
+            
+            if (allTrucks[t].currentJob == -1) {
+                allTrucks[t].currentJob = p;
+                allTrucks[t].mode = 1;
+            } else {
+                allTrucks[t].jobList[allTrucks[t].jobCount++] = p;
+            }
+            
+            allPackages[p].state = 2;
+            allPackages[p].truckOwner = t;
+        }
+    }
+
+    free(assignment);
+    freeCostMatrix(costMatrix, n);
+    free(idleTrucks);
+    free(waitingPackages);
+}
+
+void planNextActions() {
+    pthread_t workerThreads[MAX_TRUCKS];
+    AuthTask taskData[MAX_TRUCKS];
+    bool hasThread[MAX_TRUCKS] = {false};
+    char plannedMoves[MAX_TRUCKS];
+
+    for (int t = 0; t < truckCount; t++) {
+        memory->pickUpCommands[t] = -1;
+        memory->dropOffCommands[t] = -1;
+        strcpy(memory->authStrings[t], "");
+
+        if (memory->truckTurnsInToll[t] > 0) {
+            plannedMoves[t] = 's';
+            continue;
+        }
+
+        int* position = memory->truckPositions[t];
+        int currentJob = allTrucks[t].currentJob;
+        
+        if (currentJob == -1) {
+            plannedMoves[t] = 's';
+            continue;
+        }
+
+        PackageRequest* pkg = &allPackages[currentJob].info;
+        
+        if (allTrucks[t].mode == 1) {
+            plannedMoves[t] = computeNextDirection(position[0], position[1], pkg->pickup_x, pkg->pickup_y);
+
+            if (plannedMoves[t] == 's') {
+                memory->pickUpCommands[t] = currentJob;
+                allTrucks[t].mode = 2;
+                allPackages[currentJob].state = 3;
+            }
+        } else if (allTrucks[t].mode == 2) {
+            plannedMoves[t] = computeNextDirection(position[0], position[1], pkg->dropoff_x, pkg->dropoff_y);
+
+            if (plannedMoves[t] == 's') {
+                memory->dropOffCommands[t] = currentJob;
+                allPackages[currentJob].state = 4;
+                
+                if (allTrucks[t].jobCount > 0) {
+                    allTrucks[t].currentJob = allTrucks[t].jobList[0];
+                    for (int j = 0; j < allTrucks[t].jobCount - 1; j++) {
+                        allTrucks[t].jobList[j] = allTrucks[t].jobList[j + 1];
+                    }
+                    allTrucks[t].jobCount--;
+                    allTrucks[t].mode = 1;
+                } else {
+                    allTrucks[t].currentJob = -1;
+                    allTrucks[t].mode = 0;
+                }
+            }
+        } else {
+            plannedMoves[t] = 's';
+        }
+    }
+
+    for (int t = 0; t < truckCount; t++) {
+        int packageCount = memory->truckPackageCount[t];
+        
+        if (memory->truckTurnsInToll[t] == 0 && plannedMoves[t] != 's' && packageCount > 0) {
+            taskData[t].truckIndex = t;
+            taskData[t].stringLength = packageCount;
+            
+            if (pthread_create(&workerThreads[t], NULL, solverWorker, &taskData[t]) != 0) {
+                perror("[Solution] pthread_create");
+            }
+            hasThread[t] = true;
+        } else {
+            memory->truckMovementInstructions[t] = plannedMoves[t];
+        }
+    }
+
+    for (int t = 0; t < truckCount; t++) {
+        if (hasThread[t]) {
+            pthread_join(workerThreads[t], NULL);
+            memory->truckMovementInstructions[t] = plannedMoves[t];
+        }
+    }
+}
+
+void processTurn(int turnNumber, int newPackages) {
+    activeTurn = turnNumber;
+    assignPackagesToTrucks(newPackages);
+    planNextActions();
+}
+
+int main() {
+    FILE *inputFile = fopen("input.txt", "r");
+    
+    if (inputFile == NULL) {
+        perror("[Solution] Error: Could not open input.txt");
+        printf("[Solution] Make sure helper.c has run and input.txt exists.\n");
+        exit(1);
+    }
+
+    fscanf(inputFile, "%d %d %d %d %d %d %d", &gridDim, &truckCount, &solverCount, &maxTurnLimit, &boothCount, &memoryKey, &mainQueueKey);
+    
+    for (int i = 0; i < solverCount; i++) {
+        fscanf(inputFile, "%d", &solverQueueKeys[i]);
+    }
+    
+    fclose(inputFile);
+
+    int memoryId = shmget(memoryKey, sizeof(MainSharedMemory), PERMS);
+    if (memoryId == -1) {
+        perror("[Solution] shmget failed");
+        exit(1);
+    }
+    memory = (MainSharedMemory *)shmat(memoryId, NULL, 0);
+    if (memory == (void*)-1) {
+        perror("[Solution] shmat failed");
+        exit(1);
+    }
+
+    mainQueue = msgget(mainQueueKey, PERMS);
+    if (mainQueue == -1) {
+        perror("[Solution] msgget (mainQueue) failed");
+        exit(1);
+    }
+
+    for (int i = 0; i < solverCount; i++) {
+        solverQueues[i] = msgget(solverQueueKeys[i], PERMS);
+        if (solverQueues[i] == -1) {
+            perror("[Solution] msgget (solverQueue) failed");
+            exit(1);
+        }
+    }
+
+    pthread_mutex_init(&solverMutex, NULL);
+    pthread_cond_init(&solverCondition, NULL);
+    solverPoolSize = solverCount;
+    for (int i = 0; i < solverCount; i++) {
+        availableSolvers[i] = i;
+    }
+
+    memset(allPackages, 0, sizeof(allPackages));
+    memset(allTrucks, 0, sizeof(allTrucks));
+    
+    for (int i = 0; i < truckCount; i++) {
+        allTrucks[i].currentJob = -1;
+        allTrucks[i].mode = 0;
+        allTrucks[i].jobCount = 0;
+    }
+
+    TurnChangeResponse turnMessage;
+    TurnReadyRequest readySignal;
+    readySignal.mtype = 1;
+
+    printf("[Solution] Initialization complete. Waiting for first turn...\n");
+
+    while (1) {
+        if (msgrcv(mainQueue, &turnMessage, sizeof(TurnChangeResponse) - sizeof(long), 2, 0) == -1) {
+            perror("[Solution] msgrcv (main) failed");
+            break;
+        }
+
+        if (turnMessage.errorOccured) {
+            printf("[Solution] Helper reported an error. Exiting.\n");
+            break;
+        }
+        if (turnMessage.finished) {
+            printf("[Solution] Helper reported simulation finished. Exiting.\n");
+            break;
+        }
+
+        processTurn(turnMessage.turnNumber, turnMessage.newPackageRequestCount);
+
+        if (msgsnd(mainQueue, &readySignal, sizeof(TurnReadyRequest) - sizeof(long), 0) == -1) {
+            perror("[Solution] msgsnd (ready) failed");
+            break;
+        }
+    }
+
+    shmdt(memory);
+    pthread_mutex_destroy(&solverMutex);
+    pthread_cond_destroy(&solverCondition);
+    
+    printf("[Solution] Exiting.\n");
+    return 0;
+}
