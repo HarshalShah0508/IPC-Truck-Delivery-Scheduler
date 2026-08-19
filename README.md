@@ -1,5 +1,10 @@
 # IPC-Based Truck Delivery Scheduler
 
+[![C](https://img.shields.io/badge/C-POSIX-00599C?style=flat-square&logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
+[![pthreads](https://img.shields.io/badge/Concurrency-pthreads-informational?style=flat-square)](https://en.wikipedia.org/wiki/POSIX_Threads)
+[![System V IPC](https://img.shields.io/badge/IPC-System%20V-informational?style=flat-square)](https://en.wikipedia.org/wiki/Unix_System_V)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+
 A POSIX C client that controls a fleet of delivery trucks on a grid, communicating with a course-provided simulator over System V shared memory and message queues, for the Operating Systems (CS F372) Assignment 2 at BITS Pilani.
 
 ## Problem Statement
@@ -33,12 +38,15 @@ The simulator (helper process) and solver processes are provided by the course s
 
 ```
 .
-├── helper.c              # Provided simulator/grader process (not authored for this submission)
-├── helper.h               # Shared struct/constant definitions (provided)
-├── solution.c              # Student solution: truck scheduling & IPC client
-├── testcase_gen.py          # Generates random testcase input files
-├── Testcases.txt            # Sample generated test case configurations (grid size, trucks, solvers, IPC keys)
-└── INSTRUCTIONS.md           # Build and run instructions
+├── helper.c                       # Provided simulator/grader process (not authored for this submission)
+├── helper.h                       # Shared struct/constant definitions (provided)
+├── solution.c                     # Student solution: truck scheduling & IPC client
+├── testcase_gen.py                # Generates random testcase input files
+├── LICENSE
+└── docs/
+    ├── assignment_spec.pdf        # Original assignment specification (provided)
+    ├── INSTRUCTIONS.md            # Original build/run instructions (provided)
+    └── sample_testcases.txt       # Sample generated test case configurations (grid size, trucks, solvers, IPC keys)
 ```
 
 ## How It Works
@@ -67,7 +75,7 @@ The simulator (helper process) and solver processes are provided by the course s
 - Randomly generated package requests (pickup/dropoff coordinates, arrival turn, expiry turn), capped at a configurable maximum number of arrivals per turn.
 - Randomly placed toll booth cells with random wait costs, up to a configurable maximum.
 
-Sample generated configurations (grid size, truck/solver counts, IPC keys) for four test cases are included in `Testcases.txt`.
+Sample generated configurations (grid size, truck/solver counts, IPC keys) for four test cases are included in `docs/sample_testcases.txt`.
 
 ## Installation
 
@@ -111,8 +119,10 @@ The helper process reports, per test case, the number of turns taken and the tot
 - Job scoring and sorting use an `O(n^2)` insertion sort over all (truck, package) candidate pairs each turn.
 - Authorization string discovery is an exhaustive depth-first search with worst-case `4^L` guesses per truck (`L` up to 20), parallelized across the available solver pool but not otherwise pruned or optimized.
 
+## License
+
+MIT for the authored submission (`solution.c`, `testcase_gen.py`) — see [LICENSE](LICENSE). Course-provided files (`helper.c`, `helper.h`, `docs/assignment_spec.pdf`, `docs/INSTRUCTIONS.md`) are included for context and reproducibility only and remain the property of the course staff.
+
 ## Author
 
-Harshal — BITS Pilani, Hyderabad Campus, CS F372 (Operating Systems), Assignment 2.
-
-*Course-provided files (`helper.c`, `helper.h`, `INSTRUCTIONS.md`, assignment specification) are included for context and reproducibility only; `solution.c` is the authored submission.*
+Harshal Shah — BITS Pilani, Hyderabad Campus, CS F372 (Operating Systems), Assignment 2.

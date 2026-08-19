@@ -1,0 +1,6 @@
+solution
+helper
+*.o
+*.out
+input.txt
+.DS_Store
